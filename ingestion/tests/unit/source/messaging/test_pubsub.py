@@ -282,6 +282,50 @@ class TestPubSubConnection:
         mock_subscriber.assert_called_once_with(credentials=impersonated_creds)
         mock_schema_client.assert_called_once_with(credentials=impersonated_creds)
 
+    @patch("metadata.ingestion.source.messaging.pubsub.connection.get_gcp_default_credentials")
+    @patch("metadata.ingestion.source.messaging.pubsub.connection.set_google_credentials")
+    @patch("metadata.ingestion.source.messaging.pubsub.connection.pubsub_v1.PublisherClient")
+    @patch("metadata.ingestion.source.messaging.pubsub.connection.pubsub_v1.SubscriberClient")
+    def test_whitespace_service_account_falls_back_to_default_credentials(
+        self, mock_subscriber, mock_publisher, mock_set_creds, mock_get_default_creds
+    ):
+        """A whitespace-only impersonateServiceAccount must not be passed to the
+        impersonation helper; the connector must instead fall back to ADC so that
+        clients receive real credentials instead of None (closes regression in #32808).
+        """
+        from metadata.ingestion.source.messaging.pubsub.connection import PubSubConnection
+
+        default_creds = MagicMock()
+        mock_get_default_creds.return_value = default_creds
+
+        mock_connection = MagicMock()
+        mock_connection.projectId = "test-project"
+        mock_connection.useEmulator = False
+        mock_connection.hostPort = None
+        mock_connection.schemaRegistryEnabled = False
+        mock_connection.gcpConfig = MagicMock()
+        mock_connection.gcpConfig.gcpImpersonateServiceAccount = MagicMock()
+        mock_connection.gcpConfig.gcpImpersonateServiceAccount.impersonateServiceAccount = "   "
+
+        PubSubConnection(mock_connection)._get_client()
+
+        mock_get_default_creds.assert_called_once()
+        mock_publisher.assert_called_once_with(credentials=default_creds)
+        mock_subscriber.assert_called_once_with(credentials=default_creds)
+
+    def test_emulator_without_host_port_raises(self):
+        """useEmulator=True with no hostPort must raise a clear ValueError rather
+        than silently falling through to the GCP credential path.
+        """
+        from metadata.ingestion.source.messaging.pubsub.connection import PubSubConnection
+
+        mock_connection = MagicMock()
+        mock_connection.useEmulator = True
+        mock_connection.hostPort = None
+
+        with pytest.raises(ValueError, match="hostPort"):
+            PubSubConnection(mock_connection)._get_client()
+
     def test_get_project_id_from_connection(self):
         """Test _get_project_id extracts project ID from connection config"""
         from metadata.ingestion.source.messaging.pubsub.connection import (
