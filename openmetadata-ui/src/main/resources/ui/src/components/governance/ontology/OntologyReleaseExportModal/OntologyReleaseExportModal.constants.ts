@@ -11,24 +11,31 @@
  *  limitations under the License.
  */
 
-import { OntologyExportFormat } from '../../../../rest/rdfAPI';
+import { OntologyReleaseExportFormat } from '../../../../rest/ontologyExport.constants';
+
+export type OntologyReleaseExportCard =
+  | 'turtle'
+  | 'rdfxml'
+  | 'skos'
+  | 'jsonld'
+  | 'csv';
 
 interface OntologyReleaseExportFormatOption {
   readonly descriptionKey: string;
-  readonly format: OntologyExportFormat;
+  readonly format: OntologyReleaseExportCard;
   readonly labelKey: string;
 }
 
 export const ONTOLOGY_RELEASE_EXPORT_FORMATS = [
   {
-    descriptionKey: 'message.ontology-format-owl-description',
-    format: 'rdfxml',
-    labelKey: 'label.rdf-xml',
-  },
-  {
     descriptionKey: 'message.ontology-format-turtle-description',
     format: 'turtle',
     labelKey: 'label.turtle',
+  },
+  {
+    descriptionKey: 'message.ontology-format-owl-description',
+    format: 'rdfxml',
+    labelKey: 'label.rdf-xml',
   },
   {
     descriptionKey: 'message.ontology-format-jsonld-description',
@@ -36,10 +43,22 @@ export const ONTOLOGY_RELEASE_EXPORT_FORMATS = [
     labelKey: 'label.json-ld',
   },
   {
-    descriptionKey: 'message.ontology-format-n-triples-description',
-    format: 'ntriples',
-    labelKey: 'label.n-triples',
+    descriptionKey: 'message.ontology-format-csv-description',
+    format: 'csv',
+    labelKey: 'label.csv',
+  },
+  {
+    descriptionKey: 'message.ontology-format-skos-description',
+    format: 'skos',
+    labelKey: 'label.skos-skos-xl',
   },
 ] satisfies readonly OntologyReleaseExportFormatOption[];
+
+/** The SKOS card writes SKOS-XL labels when the toggle is on; every other card is its own format. */
+export const resolveExportFormat = (
+  card: OntologyReleaseExportCard,
+  skosXl: boolean
+): OntologyReleaseExportFormat =>
+  card === 'skos' && skosXl ? 'skos-xl' : card;
 
 export const ONTOLOGY_RELEASE_PREVIEW_LIMIT = 1800;

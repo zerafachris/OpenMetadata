@@ -14,13 +14,12 @@ import {
   Alert,
   Box,
   Button,
-  Input,
   Select,
   Typography,
 } from '@openmetadata/ui-core-components';
-import { Search } from '@openmetadata/ui-core-components/icons';
-import { useQuery } from '@tanstack/react-query';
-import { useMemo, useState } from 'react';
+import { keepPreviousData, useInfiniteQuery } from '@tanstack/react-query';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Collection, ListBoxLoadMoreItem } from 'react-aria-components';
 import { useTranslation } from 'react-i18next';
 import { AssetType } from '../../../../generated/api/data/updateOntologyConceptBinding';
 import { Include } from '../../../../generated/type/include';
@@ -28,17 +27,30 @@ import { useDebouncedValue } from '../../../../hooks/common/useDebouncedValue';
 import { useOntologyConceptBindings } from '../../../../hooks/governance/ontology/useOntologyConceptBindings';
 import { searchTableColumnsById } from '../../../../rest/tableAPI';
 import { getEntityName } from '../../../../utils/EntityNameUtils';
-import { getOntologyColumnOptions } from '../../../../utils/governance/ontology/OntologyConceptBindings.utils';
+import { suggestColumnForProperty } from '../../../../utils/governance/ontology/OntologyBindingSuggestion.utils';
+import {
+  getOntologyBindingWriteMessage,
+  getOntologyColumnOptions,
+} from '../../../../utils/governance/ontology/OntologyConceptBindings.utils';
+import { showErrorToast, showSuccessToast } from '../../../../utils/ToastUtils';
+import { ONTOLOGY_COLUMN_PAGE_SIZE } from './OntologyConceptInspector.constants';
+import { ConceptFormCard } from './OntologyConceptSection';
+
+type ColumnOption = ReturnType<typeof getOntologyColumnOptions>[number];
 
 interface OntologyColumnBindingEditorProps {
   conceptId: string;
   propertyId: string;
+  propertyLabel?: string;
+  isIdentifier?: boolean;
   onClose: () => void;
 }
 
 const OntologyColumnBindingEditor = ({
   conceptId,
   propertyId,
+  propertyLabel,
+  isIdentifier,
   onClose,
 }: OntologyColumnBindingEditorProps) => {
   const { t } = useTranslation();
@@ -48,182 +60,226 @@ const OntologyColumnBindingEditor = ({
       (asset) => asset.assetType === AssetType.Table
     ) ?? [];
   const [tableId, setTableId] = useState(tables[0]?.assetId ?? '');
-  const revision = bindings.data?.revision;
+  const lifecycle = useRef<AbortController>();
+  useEffect(() => {
+    const controller = new AbortController();
+    lifecycle.current = controller;
+
+    return () => controller.abort();
+  }, [conceptId, propertyId]);
   const [search, setSearch] = useState('');
-  const query = useDebouncedValue(search, 250);
-  const [page, setPage] = useState(0);
-  const [columnId, setColumnId] = useState('');
+  const [chosen, setChosen] = useState<ColumnOption>();
+  const [activeLabel, setActiveLabel] = useState<string>();
+  // Selecting fills the input with the column's label; that text is not a search.
+  const query = useDebouncedValue(search === activeLabel ? '' : search, 250);
   const table = tables.find((asset) => asset.assetId === tableId);
-  const columns = useQuery({
-    queryKey: ['ontology-binding-columns', tableId, query, page],
+  const columns = useInfiniteQuery({
+    queryKey: ['ontology-binding-columns', tableId, query],
     enabled: Boolean(table),
     retry: false,
     gcTime: 30_000,
-    queryFn: () =>
+    initialPageParam: 0,
+    // Keeps the list, and the input enabled, while the next search loads.
+    placeholderData: keepPreviousData,
+    queryFn: ({ pageParam }) =>
       searchTableColumnsById(tableId, {
         q: query,
-        limit: 25,
-        offset: page * 25,
+        limit: ONTOLOGY_COLUMN_PAGE_SIZE,
+        offset: pageParam,
         include: Include.NonDeleted,
       }),
+    getNextPageParam: (last, pages) => {
+      const loaded = pages.length * ONTOLOGY_COLUMN_PAGE_SIZE;
+
+      return loaded < last.paging.total ? loaded : undefined;
+    },
   });
   const options = useMemo(
     () =>
-      getOntologyColumnOptions(
-        columns.data?.data ?? [],
-        table?.asset.fullyQualifiedName ?? ''
-      ),
+      table?.asset.fullyQualifiedName
+        ? getOntologyColumnOptions(
+            columns.data?.pages.flatMap((page) => page.data) ?? [],
+            table.asset.fullyQualifiedName
+          )
+        : [],
     [columns.data, table?.asset.fullyQualifiedName]
   );
-  const selected = options.find((option) => option.id === columnId);
-  const save = () => {
-    if (!table || !selected || revision === undefined) {
+  const suggested = useMemo(
+    () =>
+      propertyLabel
+        ? suggestColumnForProperty(
+            { label: propertyLabel, isIdentifier },
+            options
+          )
+        : undefined,
+    [isIdentifier, options, propertyLabel]
+  );
+  // The suggestion is fixed from the unfiltered list; recomputing it from a
+  // search would drop the selection and reset the text being typed.
+  useEffect(() => {
+    if (!chosen && !query && suggested) {
+      setChosen(suggested);
+    }
+  }, [chosen, query, suggested]);
+  const selected = chosen ?? suggested;
+  useEffect(() => setActiveLabel(selected?.label), [selected?.label]);
+  const save = async () => {
+    const signal = lifecycle.current?.signal;
+    if (!signal || signal.aborted) {
       return;
     }
-    bindings.update.mutate(
-      {
-        id: conceptId,
-        request: {
-          expectedRevision: revision,
-          asset: {
-            assetId: table.assetId,
-            assetType: AssetType.Table,
-            columns: [
-              ...table.columns
-                .filter(
-                  (column) =>
-                    column.propertyId !== propertyId ||
-                    JSON.stringify(column.columnPath) !== selected.id
-                )
-                .map(({ propertyId, columnPath }) => ({
-                  propertyId,
-                  columnPath,
-                })),
-              { propertyId, columnPath: selected.path },
-            ],
-          },
-        },
-      },
-      { onSuccess: onClose }
+    const snapshot = bindings.editableSnapshot;
+    const editableTable = snapshot?.assets.find(
+      (asset) => asset.assetId === tableId
     );
+    if (!editableTable || !selected || !snapshot) {
+      return;
+    }
+    const result = await bindings.replaceAsset({
+      expectedRevision: snapshot.revision,
+      asset: {
+        assetId: editableTable.assetId,
+        assetType: AssetType.Table,
+        columns: [
+          ...editableTable.columns
+            .filter(
+              (column) =>
+                column.propertyId !== propertyId ||
+                JSON.stringify(column.columnPath) !== selected.id
+            )
+            .map(({ propertyId, columnPath }) => ({
+              propertyId,
+              columnPath,
+            })),
+          { propertyId, columnPath: selected.path },
+        ],
+      },
+    });
+    if (!signal.aborted) {
+      const notify =
+        result.kind === 'confirmed' ? showSuccessToast : showErrorToast;
+      notify(t(getOntologyBindingWriteMessage(result)));
+      if (result.kind === 'confirmed') {
+        onClose();
+      }
+    }
   };
 
-  const renderColumns = () => (
-    <>
-      {columns.isError ? (
-        <Alert variant="error">
-          {t('message.temporary-error-try-reloading')}
+  const renderColumns = () =>
+    columns.isError ? (
+      <Alert
+        rightContent={
           <Button
             color="link-color"
             size="xs"
             onPress={() => void columns.refetch()}>
             {t('label.retry')}
           </Button>
-        </Alert>
-      ) : (
-        <Select
-          isDisabled={columns.isPending || columns.isFetching}
-          items={options}
-          label={t('label.column')}
-          size="sm"
-          value={columnId}
-          onChange={(id) => setColumnId(String(id))}>
+        }
+        variant="error">
+        {t('message.temporary-error-try-reloading')}
+      </Alert>
+    ) : (
+      <Select.ComboBox
+        allowsEmptyCollection
+        data-testid="ontology-binding-column-select"
+        emptyState={t('label.no-data-found')}
+        fontSize="sm"
+        isDisabled={columns.isPending}
+        items={options}
+        key={tableId}
+        label={t('label.column')}
+        placeholder={t('label.search-entity', {
+          entity: t('label.column-plural'),
+        })}
+        shortcut={false}
+        size="sm"
+        value={selected?.id ?? null}
+        onChange={(id) => {
+          const option = options.find((item) => item.id === id);
+          if (option) {
+            setChosen(option);
+          }
+        }}
+        onInputChange={setSearch}>
+        <Collection items={options}>
           {(item) => (
             <Select.Item
               id={item.id}
-              key={item.id}
               label={item.label}
-              supportingText={
-                options.find((option) => option.id === item.id)?.datatype
-              }
+              supportingText={[
+                item.id === suggested?.id
+                  ? t('label.ontology-suggested-column')
+                  : undefined,
+                item.datatype,
+              ]
+                .filter(Boolean)
+                .join(' · ')}
+              textValue={item.label}
             />
           )}
-        </Select>
-      )}
-      {columns.data && columns.data.paging.total > 25 ? (
-        <Box gap={2}>
-          <Button
-            color="secondary"
-            isDisabled={page === 0 || columns.isFetching}
-            size="xs"
-            onPress={() => {
-              setPage((value) => value - 1);
-              setColumnId('');
-            }}>
-            {t('label.previous')}
-          </Button>
-          <Button
-            color="secondary"
-            isDisabled={
-              (page + 1) * 25 >= columns.data.paging.total || columns.isFetching
+        </Collection>
+        <ListBoxLoadMoreItem
+          isLoading={columns.isFetchingNextPage}
+          onLoadMore={() => {
+            if (columns.hasNextPage && !columns.isFetchingNextPage) {
+              void columns.fetchNextPage();
             }
-            size="xs"
-            onPress={() => {
-              setPage((value) => value + 1);
-              setColumnId('');
-            }}>
-            {t('label.next')}
-          </Button>
-        </Box>
-      ) : null}
-    </>
+          }}
+        />
+      </Select.ComboBox>
+    );
+
+  const renderTableFields = () => (
+    <Select
+      items={tables.map((item) => ({
+        id: item.assetId,
+        label: getEntityName(item.asset),
+      }))}
+      label={t('label.table')}
+      size="sm"
+      value={tableId}
+      onChange={(id) => {
+        setTableId(String(id));
+        setSearch('');
+        setChosen(undefined);
+      }}>
+      {(item) => <Select.Item id={item.id} key={item.id} label={item.label} />}
+    </Select>
   );
 
-  return (
-    <Box data-testid="ontology-column-binding-editor" direction="col" gap={3}>
+  const renderAiEditor = () => (
+    <ConceptFormCard testId="ontology-column-binding-editor">
       {tables.length === 0 ? (
-        <Typography size="text-xs">
+        <Typography className="tw:text-tertiary" size="text-sm">
           {t('message.ontology-link-table-before-binding')}
         </Typography>
       ) : (
         <>
-          <Select
-            items={tables.map((item) => ({
-              id: item.assetId,
-              label: getEntityName(item.asset),
-            }))}
-            label={t('label.table')}
-            size="sm"
-            value={tableId}
-            onChange={(id) => {
-              setTableId(String(id));
-              setPage(0);
-              setColumnId('');
-            }}>
-            {(item) => (
-              <Select.Item id={item.id} key={item.id} label={item.label} />
-            )}
-          </Select>
-          <Input
-            aria-label={t('label.search-entity', {
-              entity: t('label.column-plural'),
-            })}
-            icon={Search}
-            inputDataTestId="ontology-binding-column-search"
-            size="sm"
-            value={search}
-            onChange={(value) => {
-              setSearch(value);
-              setPage(0);
-              setColumnId('');
-            }}
-          />
+          {renderTableFields()}
           {renderColumns()}
+        </>
+      )}
+      <Box gap={2} justify="end">
+        <Button color="secondary" size="sm" onPress={onClose}>
+          {t('label.cancel')}
+        </Button>
+        {tables.length > 0 ? (
           <Button
+            color="primary"
             data-testid="ontology-binding-save"
-            isDisabled={!selected || !table || columns.isFetching}
-            isLoading={bindings.update.isPending}
-            size="xs"
+            isDisabled={!selected || !table || !bindings.editableSnapshot}
+            isLoading={bindings.isWriting}
+            size="sm"
             onPress={save}>
             {t('label.save')}
           </Button>
-        </>
-      )}
-      <Button color="secondary" size="xs" onPress={onClose}>
-        {t('label.cancel')}
-      </Button>
-    </Box>
+        ) : null}
+      </Box>
+    </ConceptFormCard>
   );
+
+  return renderAiEditor();
 };
 
 export default OntologyColumnBindingEditor;

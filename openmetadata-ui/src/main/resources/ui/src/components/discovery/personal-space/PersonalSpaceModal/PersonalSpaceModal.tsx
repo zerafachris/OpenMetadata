@@ -71,7 +71,8 @@ const PersonalSpaceModal: React.FC = () => {
     openProfile,
     isOpen,
     suppressHashClear,
-    clearSuppressHashClear
+    clearSuppressHashClear,
+    close
   );
 
   // A pathname change while the modal is open means a link inside it navigated
@@ -97,7 +98,6 @@ const PersonalSpaceModal: React.FC = () => {
       // its own body, so the overlay must not add a second scrollbar — without
       // this it scrolls the whole dialog whenever an inner page (e.g. a long team
       // table) is tall. `!` beats the core overlay's base `overflow-y-auto`.
-      isKeyboardDismissDisabled
       className="tw:overflow-hidden!"
       isOpen={isOpen}
       onOpenChange={(isOpen) => !isOpen && requestClose()}>
@@ -116,7 +116,7 @@ const PersonalSpaceModal: React.FC = () => {
           <PersonalSpaceGate>
             {activePanel === 'profile' && <ProfilePage />}
             {/* Both panels draw their own header, so the dialog has no title. */}
-            {activePanel === 'my-data' && <MyData />}
+            {activePanel === 'my-data' && <MyData cardVariant="muted" />}
           </PersonalSpaceGate>
         </Dialog>
       </Modal>
