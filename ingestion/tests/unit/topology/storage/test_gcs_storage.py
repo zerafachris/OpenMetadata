@@ -503,7 +503,6 @@ class TestFetchMetric(TestCase):
         self.source = Mock(spec=GcsSource)
         self.source.gcs_clients = Mock()
 
-        # Wire _fetch_metric as the real implementation bound to self.source
         self.source._fetch_metric = GcsSource._fetch_metric.__get__(self.source, GcsSource)
         self.source._get_time_interval = Mock(return_value=Mock())
 
