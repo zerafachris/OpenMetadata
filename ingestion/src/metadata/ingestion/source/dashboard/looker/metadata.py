@@ -276,8 +276,8 @@ class LookerSource(DashboardServiceSource):
         self._lookml_constants_map: dict[str, str] = {}
         self._view_data_model: DashboardDataModel | None = None
 
-        self._parsed_views: dict[str, str] | None = {}
-        self._unparsed_views: dict[str, str] | None = {}
+        self._parsed_views: dict[str, str] = {}
+        self._unparsed_views: dict[str, str] = {}
         self._derived_dependencies = nx.DiGraph()
 
         # Data models yielded by the bulk stage but not yet written by the sink. They are
@@ -1156,11 +1156,12 @@ class LookerSource(DashboardServiceSource):
         """
         build lineage by parsing the unparsed views containing derived references
         """
+        previous_view_data_model = self._view_data_model
         try:
             # Doing a reversed topological sort to process the views in the right order
             for view_name in reversed(list(nx.topological_sort(self._derived_dependencies))):
-                if view_name in self._parsed_views:
-                    # Skip if already processed
+                if view_name in self._parsed_views or view_name not in self._unparsed_views:
+                    # Skip if already processed or not waiting
                     continue
                 sql_query = self.replace_derived_references(self._unparsed_views[view_name])
                 if view_references := find_derived_references(sql_query):
@@ -1169,6 +1170,8 @@ class LookerSource(DashboardServiceSource):
                     continue
                 self._parsed_views[view_name] = sql_query
                 del self._unparsed_views[view_name]
+                if view_name in self._views_cache:
+                    self._view_data_model = self._views_cache[view_name]
                 yield from self._build_lineage_for_view(view_name, sql_query)
 
         except Exception as err:
@@ -1179,6 +1182,8 @@ class LookerSource(DashboardServiceSource):
                     stackTrace=traceback.format_exc(),
                 )
             )
+        finally:
+            self._view_data_model = previous_view_data_model
 
     def _add_dependency_edge(self, view_name: str, view_references: list[str]):
         """
@@ -1366,6 +1371,8 @@ class LookerSource(DashboardServiceSource):
                         to_entity=self._view_data_model,
                         column_lineage=column_lineage,
                     )
+                if self._unparsed_views:
+                    yield from self.build_lineage_for_unparsed_views()
 
             elif view.derived_table:
                 sql_query = view.derived_table.sql
@@ -1375,6 +1382,7 @@ class LookerSource(DashboardServiceSource):
                 if find_derived_references(sql_query):
                     sql_query = self.replace_derived_references(sql_query)
                     if view_references := find_derived_references(sql_query):
+                        self._unparsed_views[view.name] = sql_query
                         self._add_dependency_edge(view.name, view_references)
                         logger.warning(
                             f"Not all references are replaced for standalone view [{view.name}]. Parsing it later."
@@ -1383,7 +1391,7 @@ class LookerSource(DashboardServiceSource):
                 logger.debug(f"Processing standalone view [{view.name}] with SQL: \n[{sql_query}]")
                 yield from self._build_lineage_for_view(view.name, sql_query)
                 if self._unparsed_views:
-                    self.build_lineage_for_unparsed_views()
+                    yield from self.build_lineage_for_unparsed_views()
 
         except Exception as err:
             yield Either(
@@ -1495,6 +1503,8 @@ class LookerSource(DashboardServiceSource):
                         to_entity=self._view_data_model,
                         column_lineage=column_lineage,
                     )
+                if self._unparsed_views:
+                    yield from self.build_lineage_for_unparsed_views()
 
             elif view.derived_table:
                 sql_query = view.derived_table.sql
@@ -1505,13 +1515,14 @@ class LookerSource(DashboardServiceSource):
                     sql_query = self.replace_derived_references(sql_query)
                     # If we still have derived references, we cannot process the view
                     if view_references := find_derived_references(sql_query):
+                        self._unparsed_views[view.name] = sql_query
                         self._add_dependency_edge(view.name, view_references)
                         logger.warning(f"Not all references are replaced for view [{view.name}]. Parsing it later.")
                         return
                 logger.debug(f"Processing view [{view.name}] with SQL: \n[{sql_query}]")
                 yield from self._build_lineage_for_view(view.name, sql_query)
                 if self._unparsed_views:
-                    self.build_lineage_for_unparsed_views()
+                    yield from self.build_lineage_for_unparsed_views()
 
         except Exception as err:
             yield Either(

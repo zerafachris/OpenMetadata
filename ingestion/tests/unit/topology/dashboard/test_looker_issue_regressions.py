@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import lkml
+import networkx as nx
 import pytest
 
 from metadata.generated.schema.entity.data.dashboardDataModel import (
@@ -36,7 +37,11 @@ from metadata.ingestion.source.dashboard.looker.metadata import (
     DATAMODEL_LINEAGE_SENTINEL,
     LookerSource,
 )
-from metadata.ingestion.source.dashboard.looker.models import LkmlFile, LookMlView
+from metadata.ingestion.source.dashboard.looker.models import (
+    LkmlFile,
+    LookMlDerivedTableField,
+    LookMlView,
+)
 
 
 def _conditional_table(condition: str) -> str:
@@ -60,9 +65,12 @@ def _view_lineage_source() -> LookerSource:
     source._explores_cache = {}
     source._views_cache = {}
     source._parsed_views = {}
+    source._unparsed_views = {}
+    source._derived_dependencies = nx.DiGraph()
     source._lookml_constants_map = {}
     source._view_data_model = _view_data_model(LookMlView(name="table_details"))
     source._added_lineage = {}
+    source.source_config = SimpleNamespace(lineageInformation=None)
     return source
 
 
@@ -304,4 +312,75 @@ def test_dimension_group_column_lineage_reaches_the_data_model_column() -> None:
 
     assert [([model_str(column) for column in edge.fromColumns], model_str(edge.toColumn)) for edge in edges] == [
         (["trino.db.public.orders.created_at"], "looker.orders_view.created")
+    ]
+
+
+def test_derived_table_referencing_view_parsed_later_gets_lineage() -> None:
+    """A derived table processed before the sql_table_name view it references via
+    ``${<view>.SQL_TABLE_NAME}`` must be retried and receive lineage pointing to its own
+    data model once the referenced view is parsed."""
+    source = _view_lineage_source()
+    daily_view = LookMlView(
+        name="daily",
+        derived_table=LookMlDerivedTableField(sql="SELECT a FROM ${base.SQL_TABLE_NAME}"),
+    )
+    base_view = LookMlView(
+        name="base",
+        sql_table_name="schema_prod.table_name",
+    )
+    daily_model = _view_data_model(daily_view)
+    base_model = _view_data_model(base_view)
+    source._views_cache = {"daily": daily_model, "base": base_model}
+    explore = SimpleNamespace(model_name="finance_reports", name="table_details_explore")
+
+    with _stubbed_db_services(source) as catalog:
+        source._view_data_model = daily_model
+        first_pass = list(source.add_view_lineage(daily_view, explore))
+        assert first_pass == []
+        assert source._unparsed_views == {"daily": "SELECT a FROM (${base.SQL_TABLE_NAME})"}
+
+        source._view_data_model = base_model
+        second_pass = list(source.add_view_lineage(base_view, explore))
+
+    assert source._unparsed_views == {}
+    assert all(result.left is None for result in second_pass)
+    edges = [(result.right.edge.fromEntity.id, result.right.edge.toEntity.id) for result in second_pass]
+    table_id = catalog.tables["trino_service"].id
+    assert edges == [
+        (table_id, base_model.id),
+        (table_id, daily_model.id),
+    ]
+
+
+def test_standalone_derived_table_referencing_view_parsed_later_gets_lineage() -> None:
+    """Standalone derived views processed before the view they reference must also be
+    retried when the referenced view is parsed later in the standalone pass."""
+    source = _view_lineage_source()
+    daily_view = LookMlView(
+        name="daily",
+        derived_table=LookMlDerivedTableField(sql="SELECT a FROM ${base.SQL_TABLE_NAME}"),
+    )
+    base_view = LookMlView(
+        name="base",
+        sql_table_name="schema_prod.table_name",
+    )
+    daily_model = _view_data_model(daily_view)
+    base_model = _view_data_model(base_view)
+    source._views_cache = {"daily": daily_model, "base": base_model}
+
+    with _stubbed_db_services(source) as catalog:
+        source._view_data_model = daily_model
+        assert list(source._add_standalone_view_lineage(daily_view, "finance_project", "finance_reports")) == []
+        assert "daily" in source._unparsed_views
+
+        source._view_data_model = base_model
+        second_pass = list(source._add_standalone_view_lineage(base_view, "finance_project", "finance_reports"))
+
+    assert source._unparsed_views == {}
+    assert all(result.left is None for result in second_pass)
+    edges = [(result.right.edge.fromEntity.id, result.right.edge.toEntity.id) for result in second_pass]
+    table_id = catalog.tables["trino_service"].id
+    assert edges == [
+        (table_id, base_model.id),
+        (table_id, daily_model.id),
     ]
