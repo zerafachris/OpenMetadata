@@ -36,7 +36,12 @@ from metadata.ingestion.source.dashboard.looker.metadata import (
     DATAMODEL_LINEAGE_SENTINEL,
     LookerSource,
 )
-from metadata.ingestion.source.dashboard.looker.models import LkmlFile, LookMlView
+from metadata.ingestion.source.dashboard.looker.models import (
+    LkmlFile,
+    LookMlDerivedTableField,
+    LookMlField,
+    LookMlView,
+)
 
 
 def _conditional_table(condition: str) -> str:
@@ -305,3 +310,89 @@ def test_dimension_group_column_lineage_reaches_the_data_model_column() -> None:
     assert [([model_str(column) for column in edge.fromColumns], model_str(edge.toColumn)) for edge in edges] == [
         (["trino.db.public.orders.created_at"], "looker.orders_view.created")
     ]
+
+
+def test_sql_table_name_referencing_table_view_gets_table_and_column_lineage() -> None:
+    """A view with ``sql_table_name: ${<view>.SQL_TABLE_NAME}`` referencing a table-backed
+    view gets lineage from that table and column lineage from its own dimensions."""
+    source = _view_lineage_source()
+    fact_usage = LookMlView(
+        name="fact_usage",
+        sql_table_name="schema_prod.table_name",
+        dimensions=[LookMlField(name="a", sql="${TABLE}.a")],
+    )
+    usage = LookMlView(
+        name="usage",
+        sql_table_name="${fact_usage.SQL_TABLE_NAME}",
+        dimensions=[LookMlField(name="a", sql="${TABLE}.a")],
+    )
+    fact_model = _view_data_model(fact_usage)
+    usage_model = _view_data_model(usage)
+    explore = SimpleNamespace(model_name="finance_reports", name="table_details_explore")
+
+    with _stubbed_db_services(source) as catalog:
+        catalog.tables["trino_service"].columns = [
+            Column(
+                name="a",
+                dataType=DataType.STRING,
+                fullyQualifiedName="trino_service.demo_db.schema_prod.table_name.a",
+            )
+        ]
+        source._view_data_model = fact_model
+        list(source.add_view_lineage(fact_usage, explore))
+
+        source._view_data_model = usage_model
+        results = list(source.add_view_lineage(usage, explore))
+
+    assert len(results) == 1 and results[0].left is None and results[0].right is not None
+    edge = results[0].right.edge
+    assert edge.fromEntity.id == catalog.tables["trino_service"].id
+    assert edge.toEntity.id == usage_model.id
+    assert edge.lineageDetails is not None
+    assert [
+        ([model_str(column) for column in col_edge.fromColumns or []], model_str(col_edge.toColumn))
+        for col_edge in edge.lineageDetails.columnsLineage or []
+    ] == [(["trino_service.demo_db.schema_prod.table_name.a"], "looker.orders_view.a")]
+
+
+def test_sql_table_name_referencing_derived_view_gets_underlying_table_lineage() -> None:
+    """A view with ``sql_table_name: ${<view>.SQL_TABLE_NAME}`` referencing a derived table
+    view gets lineage from the derived query's underlying tables."""
+    source = _view_lineage_source()
+    source.source_config = SimpleNamespace(lineageInformation=None)
+    fact_usage = LookMlView(
+        name="fact_usage",
+        derived_table=LookMlDerivedTableField(sql="SELECT a FROM schema_prod.table_name"),
+        dimensions=[LookMlField(name="a", sql="${TABLE}.a")],
+    )
+    usage = LookMlView(
+        name="usage",
+        sql_table_name="${fact_usage.SQL_TABLE_NAME}",
+        dimensions=[LookMlField(name="a", sql="${TABLE}.a")],
+    )
+    fact_model = _view_data_model(fact_usage)
+    usage_model = _view_data_model(usage)
+
+    with _stubbed_db_services(source) as catalog:
+        catalog.tables["trino_service"].columns = [
+            Column(
+                name="a",
+                dataType=DataType.STRING,
+                fullyQualifiedName="trino_service.demo_db.schema_prod.table_name.a",
+            )
+        ]
+        source._view_data_model = fact_model
+        list(source._add_standalone_view_lineage(fact_usage, "finance_project", "finance_reports"))
+
+        source._view_data_model = usage_model
+        results = list(source._add_standalone_view_lineage(usage, "finance_project", "finance_reports"))
+
+    assert len(results) == 1 and results[0].left is None and results[0].right is not None
+    edge = results[0].right.edge
+    assert edge.fromEntity.id == catalog.tables["trino_service"].id
+    assert edge.toEntity.id == usage_model.id
+    assert edge.lineageDetails is not None
+    assert [
+        ([model_str(column) for column in col_edge.fromColumns or []], model_str(col_edge.toColumn))
+        for col_edge in edge.lineageDetails.columnsLineage or []
+    ] == [(["trino_service.demo_db.schema_prod.table_name.a"], "looker.orders_view.a")]

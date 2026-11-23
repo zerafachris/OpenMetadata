@@ -276,8 +276,8 @@ class LookerSource(DashboardServiceSource):
         self._lookml_constants_map: dict[str, str] = {}
         self._view_data_model: DashboardDataModel | None = None
 
-        self._parsed_views: dict[str, str] | None = {}
-        self._unparsed_views: dict[str, str] | None = {}
+        self._parsed_views: dict[str, str] = {}
+        self._unparsed_views: dict[str, str] = {}
         self._derived_dependencies = nx.DiGraph()
 
         # Data models yielded by the bulk stage but not yet written by the sink. They are
@@ -1293,6 +1293,26 @@ class LookerSource(DashboardServiceSource):
                 continue
         return processed_column_lineage
 
+    def _resolve_sql_table_name_derived_reference(
+        self, sql_table_name: str
+    ) -> tuple[str, bool]:
+        """Resolve a ``${<view>.SQL_TABLE_NAME}`` reference in ``sql_table_name`` when the
+        referenced view has already been parsed.
+
+        Returns ``(resolved_target, is_derived_sql)`` where ``is_derived_sql`` is True when
+        the referenced view was parsed from a derived table SQL query rather than a table name.
+        """
+        view_references = find_derived_references(sql_table_name)
+        if not view_references:
+            return sql_table_name, False
+        ref_view = view_references[0]
+        if ref_view not in self._parsed_views:
+            return sql_table_name, False
+        resolved_target = self._parsed_views[ref_view]
+        if re.match(r"^\s*\(*\s*(?:SELECT|WITH)\b", resolved_target, re.IGNORECASE):
+            return resolved_target, True
+        return resolved_target, False
+
     def _add_standalone_view_lineage(  # noqa: C901
         self, view: LookMlView, project_name: str, model_name: str
     ) -> Iterable[Either[AddLineageRequest]]:
@@ -1350,22 +1370,28 @@ class LookerSource(DashboardServiceSource):
             if view.sql_table_name:
                 sql_table_name = self._resolve_lookml_constants(view.sql_table_name)
                 sql_table_name = self._render_table_name(sql_table_name, model_name, view_name=view.name)
-
-                # Column lineage only depends on the view definition, so resolve it once
-                column_lineage = self._extract_column_lineage(view)
-
-                for db_service_prefix in db_service_prefixes or []:
-                    db_service_name, *_ = self.parse_db_service_prefix(db_service_prefix)
-                    dialect = self._get_db_dialect(db_service_name)
-                    source_table_name = self._clean_table_name(sql_table_name, dialect)
-                    self._parsed_views[view.name] = source_table_name
-
-                    yield from self.build_lineage_requests(
-                        source=source_table_name,
-                        db_service_prefix=db_service_prefix,
-                        to_entity=self._view_data_model,
-                        column_lineage=column_lineage,
+                sql_table_name, is_derived_sql = self._resolve_sql_table_name_derived_reference(sql_table_name)
+                if is_derived_sql:
+                    logger.debug(
+                        f"Processing standalone view [{view.name}] referencing derived SQL: \n[{sql_table_name}]"
                     )
+                    yield from self._build_lineage_for_view(view.name, sql_table_name)
+                else:
+                    # Column lineage only depends on the view definition, so resolve it once
+                    column_lineage = self._extract_column_lineage(view)
+
+                    for db_service_prefix in db_service_prefixes or []:
+                        db_service_name, *_ = self.parse_db_service_prefix(db_service_prefix)
+                        dialect = self._get_db_dialect(db_service_name)
+                        source_table_name = self._clean_table_name(sql_table_name, dialect)
+                        self._parsed_views[view.name] = source_table_name
+
+                        yield from self.build_lineage_requests(
+                            source=source_table_name,
+                            db_service_prefix=db_service_prefix,
+                            to_entity=self._view_data_model,
+                            column_lineage=column_lineage,
+                        )
 
             elif view.derived_table:
                 sql_query = view.derived_table.sql
@@ -1478,23 +1504,27 @@ class LookerSource(DashboardServiceSource):
                     explore_name=explore.name,
                     view_name=view.name,
                 )
+                sql_table_name, is_derived_sql = self._resolve_sql_table_name_derived_reference(sql_table_name)
+                if is_derived_sql:
+                    logger.debug(f"Processing view [{view.name}] referencing derived SQL: \n[{sql_table_name}]")
+                    yield from self._build_lineage_for_view(view.name, sql_table_name)
+                else:
+                    # Column lineage only depends on the view definition, so resolve it once
+                    column_lineage = self._extract_column_lineage(view)
 
-                # Column lineage only depends on the view definition, so resolve it once
-                column_lineage = self._extract_column_lineage(view)
+                    for db_service_prefix in db_service_prefixes or []:
+                        db_service_name, *_ = self.parse_db_service_prefix(db_service_prefix)
+                        dialect = self._get_db_dialect(db_service_name)
+                        source_table_name = self._clean_table_name(sql_table_name, dialect)
+                        self._parsed_views[view.name] = source_table_name
 
-                for db_service_prefix in db_service_prefixes or []:
-                    db_service_name, *_ = self.parse_db_service_prefix(db_service_prefix)
-                    dialect = self._get_db_dialect(db_service_name)
-                    source_table_name = self._clean_table_name(sql_table_name, dialect)
-                    self._parsed_views[view.name] = source_table_name
-
-                    # View to the source is only there if we are informing the dbServiceNames
-                    yield from self.build_lineage_requests(
-                        source=source_table_name,
-                        db_service_prefix=db_service_prefix,
-                        to_entity=self._view_data_model,
-                        column_lineage=column_lineage,
-                    )
+                        # View to the source is only there if we are informing the dbServiceNames
+                        yield from self.build_lineage_requests(
+                            source=source_table_name,
+                            db_service_prefix=db_service_prefix,
+                            to_entity=self._view_data_model,
+                            column_lineage=column_lineage,
+                        )
 
             elif view.derived_table:
                 sql_query = view.derived_table.sql
