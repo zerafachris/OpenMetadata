@@ -305,3 +305,94 @@ def test_dimension_group_column_lineage_reaches_the_data_model_column() -> None:
     assert [([model_str(column) for column in edge.fromColumns], model_str(edge.toColumn)) for edge in edges] == [
         (["trino.db.public.orders.created_at"], "looker.orders_view.created")
     ]
+
+
+NATIVE_DERIVED_TABLE_VIEW = """
+view: usage_ndt {
+  derived_table: {
+    explore_source: usage {
+      column: partner_id { field: partners.id }
+      column: created_date {}
+    }
+  }
+  dimension: partner_id { sql: ${TABLE}.partner_id ;; }
+  dimension: created_date { sql: ${TABLE}.created_date ;; }
+}
+"""
+
+
+def _explore_data_model(name: str, columns: list[str]) -> DashboardDataModel:
+    return DashboardDataModel(
+        id=uuid.uuid4(),
+        name=name,
+        service=EntityReference(id=uuid.uuid4(), type="dashboardService"),
+        dataModelType=DataModelType.LookMlExplore,
+        columns=[
+            Column(
+                name=col,
+                dataType=DataType.STRING,
+                fullyQualifiedName=FullyQualifiedEntityName(f"looker.{name}.{col}"),
+            )
+            for col in columns
+        ],
+    )
+
+
+def test_native_derived_table_gets_explore_and_column_lineage_in_explore() -> None:
+    """A native derived table (`explore_source`) joined into an explore gets lineage from the
+    source Explore data model, with column links for mapped `field` and default column names."""
+    view = LkmlFile.model_validate(lkml.load(NATIVE_DERIVED_TABLE_VIEW)).views[0]
+    source = _view_lineage_source()
+    ndt_model = _view_data_model(view)
+    source_explore = _explore_data_model("finance_reports_usage", ["partners.id", "usage.created_date"])
+    target_explore = _explore_data_model("finance_reports_dashboard_explore", ["usage_ndt.partner_id"])
+    source._view_data_model = ndt_model
+    source._explores_cache = {
+        "finance_reports_usage": source_explore,
+        "finance_reports_dashboard_explore": target_explore,
+    }
+    explore_ref = SimpleNamespace(model_name="finance_reports", name="dashboard_explore")
+
+    with _stubbed_db_services(source):
+        results = list(source.add_view_lineage(view, explore_ref))
+
+    assert len(results) == 2 and all(r.left is None and r.right is not None for r in results)
+    # First edge: view -> target_explore; Second edge: source_explore -> view
+    ndt_edge = results[1].right.edge
+    assert ndt_edge.fromEntity.id == source_explore.id
+    assert ndt_edge.toEntity.id == ndt_model.id
+    assert ndt_edge.lineageDetails is not None
+    assert [
+        ([model_str(c) for c in col.fromColumns or []], model_str(col.toColumn))
+        for col in ndt_edge.lineageDetails.columnsLineage or []
+    ] == [
+        (["looker.finance_reports_usage.partners.id"], "looker.orders_view.partner_id"),
+        (["looker.finance_reports_usage.usage.created_date"], "looker.orders_view.created_date"),
+    ]
+
+
+def test_standalone_native_derived_table_gets_explore_and_column_lineage() -> None:
+    """A standalone native derived table (`explore_source`) also gets lineage from the Explore
+    it is built from."""
+    view = LkmlFile.model_validate(lkml.load(NATIVE_DERIVED_TABLE_VIEW)).views[0]
+    source = _view_lineage_source()
+    ndt_model = _view_data_model(view)
+    source_explore = _explore_data_model("finance_reports_usage", ["partners.id", "usage.created_date"])
+    source._view_data_model = ndt_model
+    source._explores_cache = {"finance_reports_usage": source_explore}
+
+    with _stubbed_db_services(source):
+        results = list(source._add_standalone_view_lineage(view, "finance_project", "finance_reports"))
+
+    assert len(results) == 1 and results[0].left is None and results[0].right is not None
+    ndt_edge = results[0].right.edge
+    assert ndt_edge.fromEntity.id == source_explore.id
+    assert ndt_edge.toEntity.id == ndt_model.id
+    assert ndt_edge.lineageDetails is not None
+    assert [
+        ([model_str(c) for c in col.fromColumns or []], model_str(col.toColumn))
+        for col in ndt_edge.lineageDetails.columnsLineage or []
+    ] == [
+        (["looker.finance_reports_usage.partners.id"], "looker.orders_view.partner_id"),
+        (["looker.finance_reports_usage.usage.created_date"], "looker.orders_view.created_date"),
+    ]

@@ -276,8 +276,8 @@ class LookerSource(DashboardServiceSource):
         self._lookml_constants_map: dict[str, str] = {}
         self._view_data_model: DashboardDataModel | None = None
 
-        self._parsed_views: dict[str, str] | None = {}
-        self._unparsed_views: dict[str, str] | None = {}
+        self._parsed_views: dict[str, str] = {}
+        self._unparsed_views: dict[str, str] = {}
         self._derived_dependencies = nx.DiGraph()
 
         # Data models yielded by the bulk stage but not yet written by the sink. They are
@@ -1293,6 +1293,78 @@ class LookerSource(DashboardServiceSource):
                 continue
         return processed_column_lineage
 
+    def _yield_explore_source_lineage(
+        self, view: LookMlView, model_name: str | None
+    ) -> Iterable[Either[AddLineageRequest]]:
+        """Yield Explore -> View lineage for a native derived table (`explore_source`)."""
+        if not view.derived_table or not view.derived_table.explore_source or not self._view_data_model:
+            return
+        explore_source = view.derived_table.explore_source
+        source_explore_model = None
+        if model_name:
+            source_explore_name = build_datamodel_name(model_name, explore_source.name)
+            source_explore_model = self._explores_cache.get(source_explore_name)
+        if not source_explore_model:
+            suffix = f"_{clean_dashboard_name(explore_source.name)}"
+            source_explore_model = next(
+                (model for name, model in self._explores_cache.items() if model and name.endswith(suffix)),
+                None,
+            )
+        if not source_explore_model and model_name:
+            try:
+                source_explore_model = self._build_data_model(
+                    build_datamodel_name(model_name, explore_source.name)
+                )
+            except Exception:
+                logger.debug(
+                    "Explore [%s] for native derived table [%s] not found in OpenMetadata",
+                    explore_source.name,
+                    view.name,
+                )
+        if not source_explore_model:
+            logger.warning(
+                "Could not find explore [%s] for native derived table view [%s]",
+                explore_source.name,
+                view.name,
+            )
+            return
+
+        ndt_column_map: dict[str, str] = {}
+        for col in explore_source.columns or []:
+            source_field = col.field or (
+                f"{explore_source.name}.{col.name}" if "." not in col.name else col.name
+            )
+            ndt_column_map[col.name] = source_field
+
+        column_lineage: list[ColumnLineage] = []
+        for source_col, target_col in self._extract_column_lineage(view):
+            explore_field = ndt_column_map.get(source_col)
+            if not explore_field:
+                continue
+            from_column = self._get_data_model_column_fqn(
+                data_model_entity=source_explore_model,
+                column=explore_field,
+            )
+            to_column = self._get_data_model_column_fqn(
+                data_model_entity=self._view_data_model,
+                column=target_col,
+            )
+            if from_column and to_column:
+                column_lineage.append(
+                    ColumnLineage(
+                        fromColumns=[FullyQualifiedEntityName(from_column)],
+                        toColumn=FullyQualifiedEntityName(to_column),
+                    )
+                )
+
+        request = self._get_add_lineage_request(
+            from_entity=source_explore_model,
+            to_entity=self._view_data_model,
+            column_lineage=column_lineage,
+        )
+        if request:
+            yield request
+
     def _add_standalone_view_lineage(  # noqa: C901
         self, view: LookMlView, project_name: str, model_name: str
     ) -> Iterable[Either[AddLineageRequest]]:
@@ -1368,6 +1440,9 @@ class LookerSource(DashboardServiceSource):
                     )
 
             elif view.derived_table:
+                if view.derived_table.explore_source:
+                    yield from self._yield_explore_source_lineage(view, model_name)
+                    return
                 sql_query = view.derived_table.sql
                 if not sql_query:
                     return
@@ -1497,6 +1572,9 @@ class LookerSource(DashboardServiceSource):
                     )
 
             elif view.derived_table:
+                if view.derived_table.explore_source:
+                    yield from self._yield_explore_source_lineage(view, explore.model_name)
+                    return
                 sql_query = view.derived_table.sql
                 if not sql_query:
                     return

@@ -35,11 +35,28 @@ class LookMlField(BaseModel):
     tags: list[str] | None = Field(None, description="Tags for the field")
 
 
+class LookMlExploreSourceColumn(BaseModel):
+    name: str = Field(..., description="NDT column name")
+    field: str | None = Field(
+        None,
+        description="Referenced Explore field (<view>.<field>); defaults to <explore_name>.<name> when omitted",
+    )
+
+
+class LookMlExploreSource(BaseModel):
+    name: str = Field(..., description="Source Explore name")
+    columns: list[LookMlExploreSourceColumn] = Field([], description="Columns selected from the source Explore")
+
+
 class LookMlDerivedTableField(BaseModel):
     sql: str | None = Field(None, description="Declares the SQL query for a derived table.")
     sql_create: str | None = Field(
         None,
         description="Defines a SQL CREATE statement",
+    )
+    explore_source: LookMlExploreSource | None = Field(
+        None,
+        description="Declares the source Explore and columns for a native derived table.",
     )
 
 
