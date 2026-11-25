@@ -794,6 +794,87 @@ class DbtUnitTest(TestCase):
         }
         self.assertEqual("svc.db.sch.ORDERS", get_dbt_test_primary_table_fqn(dbt_test))
 
+    def test_dbt_relationships_test_skips_when_tested_table_not_in_openmetadata(self):
+        """When the tested child table is absent from OpenMetadata (so only the referenced
+        `to:` parent table resolves into `upstream`), `get_dbt_test_primary_table_fqn` and
+        `generate_entity_link` must not fall back to `upstream[0]` (issue #38654)."""
+        manifest_node = self._get_relationships_test_node()
+        dbt_test = {
+            "manifest_node": manifest_node,
+            "upstream": ["svc.db.sch.CUSTOMERS"],
+            "upstream_by_name": {"customers": "svc.db.sch.CUSTOMERS", "jaffle_shop.customers": "svc.db.sch.CUSTOMERS"},
+            "results": SimpleNamespace(
+                status=SimpleNamespace(value="fail"),
+                message="Got 1 result, configured to fail if != 0",
+                unique_id="test.jaffle_shop.relationships_orders_customer_id__customer_id__ref_customers_.c6ec7f58f2",
+                timing=[SimpleNamespace(name="execute", completed_at="2026-07-24T09:00:00.000000Z")],
+            ),
+        }
+        self.assertIsNone(get_dbt_test_primary_table_fqn(dbt_test))
+        self.assertListEqual([], generate_entity_link(dbt_test=dbt_test))
+        self.assertListEqual([], list(self.dbt_source_obj.create_dbt_test_case(dbt_test)))
+        with patch.object(self.dbt_source_obj.metadata, "add_test_case_results") as mock_add_results:
+            self.dbt_source_obj.add_dbt_test_result(dbt_test)
+            mock_add_results.assert_not_called()
+
+    def test_dbt_relationships_test_skips_when_tested_model_absent_and_shares_bare_name_with_referenced_source(self):
+        """When a model and its referenced `source()` share the bare dbt name (e.g. `orders`)
+        and the tested model's table is absent from OpenMetadata, `upstream_by_name['orders']`
+        points to the source table; `ref('orders')` must not attach the test to the source."""
+        manifest_node = SimpleNamespace(
+            name="relationships_orders_customer_id",
+            column_name="customer_id",
+            test_metadata=SimpleNamespace(
+                name="relationships",
+                kwargs={
+                    "to": "source('raw', 'orders')",
+                    "field": "id",
+                    "column_name": "customer_id",
+                    "model": "{{ get_where_subquery(ref('orders')) }}",
+                },
+            ),
+        )
+        source_node = UpstreamNode(name="orders", qualified_name="raw.orders", fqn="svc.db.raw.orders")
+        dbt_test = {
+            "manifest_node": manifest_node,
+            "upstream": [source_node.fqn],
+            "upstream_by_name": build_upstream_name_map([source_node]),
+            "results": "",
+        }
+        self.assertIsNone(get_dbt_test_primary_table_fqn(dbt_test))
+        self.assertListEqual([], generate_entity_link(dbt_test=dbt_test))
+
+    def test_dbt_relationships_test_self_referential_resolves_when_to_matches_model(self):
+        """A self-referential relationships test (e.g. `employees.manager_id -> employees.id`)
+        where `model` and `to` reference the same table must still resolve that table."""
+        manifest_node = SimpleNamespace(
+            name="relationships_employees_manager_id__id__ref_employees_",
+            column_name="manager_id",
+            test_metadata=SimpleNamespace(
+                name="relationships",
+                kwargs={
+                    "to": "ref('employees')",
+                    "field": "id",
+                    "column_name": "manager_id",
+                    "model": "{{ get_where_subquery(ref('employees')) }}",
+                },
+            ),
+        )
+        employee_node = UpstreamNode(
+            name="employees", qualified_name="jaffle_shop.employees", fqn="svc.db.sch.employees"
+        )
+        dbt_test = {
+            "manifest_node": manifest_node,
+            "upstream": [employee_node.fqn],
+            "upstream_by_name": build_upstream_name_map([employee_node]),
+            "results": "",
+        }
+        self.assertEqual("svc.db.sch.employees", get_dbt_test_primary_table_fqn(dbt_test))
+        self.assertListEqual(
+            ["<#E::table::svc.db.sch.employees::columns::manager_id>"],
+            generate_entity_link(dbt_test=dbt_test),
+        )
+
     def test_build_upstream_name_map_marks_duplicate_names_ambiguous(self):
         """A model and a source table can share a dbt name; the bare name must not
         silently resolve to whichever happened to be indexed last."""

@@ -840,10 +840,20 @@ def get_dbt_test_primary_table_fqn(dbt_test) -> str | None:
     upstream_by_name = dbt_test.get(DbtCommonEnum.UPSTREAM_BY_NAME.value) or {}
     kwargs = _get_test_kwargs(manifest_node)
 
-    primary_table_fqn = _resolve_upstream_fqn(upstream_list, upstream_by_name, kwargs.get("model"))
+    to_reference = kwargs.get("to")
+    model_reference = kwargs.get("model")
+    candidate_upstreams = upstream_list
+    candidate_by_name = upstream_by_name
+    if to_reference:
+        referenced_fqn = _resolve_upstream_fqn(upstream_list, upstream_by_name, to_reference)
+        if referenced_fqn and _extract_dbt_reference(model_reference) != _extract_dbt_reference(to_reference):
+            candidate_upstreams = [fqn for fqn in upstream_list if fqn != referenced_fqn]
+            candidate_by_name = {name: fqn for name, fqn in upstream_by_name.items() if fqn != referenced_fqn}
+
+    primary_table_fqn = _resolve_upstream_fqn(candidate_upstreams, candidate_by_name, model_reference)
     if not primary_table_fqn:
         primary_table_fqn = _resolve_by_excluding_referenced_table(upstream_list, upstream_by_name, kwargs)
-    if not primary_table_fqn and upstream_list:
+    if not primary_table_fqn and upstream_list and not to_reference:
         primary_table_fqn = upstream_list[0]
 
     return primary_table_fqn
